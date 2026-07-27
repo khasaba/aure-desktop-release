@@ -1,0 +1,1342 @@
+name: Build Desktop Release
+
+on:
+  repository_dispatch:
+    types: [build-release]
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "Target os-platform build"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - macos-x64
+          - macos-arm64
+          - windows-x64
+      tag:
+        description: "Git tag to build (optional, defaults to default branch HEAD)"
+        required: false
+        type: string
+
+env:
+  PNPM_VERSION: "9.15.0"
+  NODE_VERSION: "22"
+  PYTHON_STANDALONE_VERSION: "3.12.13"
+  BUN_VERSION: "1.3.13"
+  UV_VERSION: "0.11.8"
+  RIPGREP_VERSION: "15.1.0"
+  R2_BUCKET: "files"
+  R2_RELEASE_PREFIX: "releases/tyclaw"
+  # Current three-platform stable artifacts are about 645MB per version.
+  # Keep 12 versions to stay below 10GB with room for package growth.
+  R2_STABLE_RELEASES_TO_KEEP: "12"
+
+jobs:
+  build-mac-x64:
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.os == 'all' || github.event.inputs.os == 'macos-x64')) ||
+        (github.event_name == 'repository_dispatch' && (github.event.client_payload.os == '' || github.event.client_payload.os == 'all' || github.event.client_payload.os == 'macos-x64'))
+      }}
+    runs-on: macos-15-intel
+    steps:
+      - name: Clone source from GitLab
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+          REPO_URL="https://${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}:${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}@gitlab.igora.ai/ty/aure-desktop.git"
+          if [ -n "$TAG" ]; then
+            echo "Cloning tagged source: $TAG"
+            git clone --depth 1 --branch "$TAG" "$REPO_URL" source
+          else
+            echo "No tag provided, cloning default branch HEAD"
+            git clone --depth 1 "$REPO_URL" source
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Read source commit
+        id: git_ref
+        working-directory: source
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Source short SHA: $SHORT_SHA"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # setup-node emits node-cache-* entries; keep that family in sync
+          # with prune-actions-cache.yml when changing cache inputs here.
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Cache Electron binaries
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          # Keep this prefix aligned with prune-actions-cache.yml family rules.
+          key: ${{ runner.os }}-electron-${{ hashFiles('source/apps/desktop/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile --filter desktop...
+
+      - name: Build packages
+        working-directory: source
+        run: pnpm --filter 'desktop^...' build
+
+      - name: Fetch tailos runtime (x64)
+        working-directory: source
+        run: |
+          # 从 tailos-core 的 Release 按 runner 架构拉取预编译 runtime（替代本地 cargo 构建）。
+          # 版本由 tailos-runtime.lock 锁定，校验 sha256 后解包到 resources/bin。
+          node scripts/ensure-tailos-cli.mjs --force
+          test -x apps/desktop/resources/bin/tailos
+          test -x apps/desktop/resources/bin/tailos-python-shim
+          file apps/desktop/resources/bin/tailos*
+
+      - name: Fetch agent-browser (x64)
+        working-directory: source
+        env:
+          TAILOS_AGENT_BROWSER_TARGET_PLATFORM: darwin
+          TAILOS_AGENT_BROWSER_TARGET_ARCH: x64
+        run: |
+          node scripts/ensure-agent-browser.mjs --force
+          test -x apps/desktop/resources/bin/agent-browser
+          test -f apps/desktop/resources/agent-browser/skill-data/core/SKILL.md
+          apps/desktop/resources/bin/agent-browser --version
+
+      - name: Restore macOS x64 runtime downloads
+        id: macos_x64_runtime_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: source/.runtime-cache/macos-x64
+          # Keep this prefix aligned with prune-actions-cache.yml family rules.
+          key: ${{ runner.os }}-runtime-macos-x64-bun-${{ env.BUN_VERSION }}-uv-${{ env.UV_VERSION }}-rg-${{ env.RIPGREP_VERSION }}
+
+      - name: Prepare macOS x64 runtime binaries
+        working-directory: source/apps/desktop
+        run: |
+          set -euo pipefail
+
+          mkdir -p resources/bin
+          CACHE_DIR="../../.runtime-cache/macos-x64"
+          mkdir -p "$CACHE_DIR"
+
+          download_cached() {
+            local url="$1"
+            local output="$2"
+
+            if [ -s "$output" ]; then
+              echo "Using cached $(basename "$output")"
+              return
+            fi
+
+            local tmp="${output}.tmp"
+            rm -f "$tmp"
+            echo "Downloading $url"
+
+            local attempt=1
+            local max_attempts=6
+            until curl -fSL --connect-timeout 20 --max-time 300 "$url" -o "$tmp"; do
+              local status=$?
+              rm -f "$tmp"
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Download failed after $attempt attempts: $url" >&2
+                return "$status"
+              fi
+
+              echo "Download failed with exit code $status. Retrying in 10s ($attempt/$max_attempts)..."
+              sleep 10
+              attempt=$((attempt + 1))
+            done
+
+            mv "$tmp" "$output"
+          }
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          BUN_ARCHIVE="bun-darwin-x64.zip"
+          BUN_ASSET_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ARCHIVE}"
+          download_cached "$BUN_ASSET_URL" "$CACHE_DIR/$BUN_ARCHIVE"
+          unzip -o "$CACHE_DIR/$BUN_ARCHIVE" -d "$TMP_DIR/bun-extract"
+          cp "$TMP_DIR/bun-extract/bun-darwin-x64/bun" resources/bin/bun
+          chmod +x resources/bin/bun
+          echo "bun version: $(resources/bin/bun --version)"
+
+          UV_ARCHIVE="uv-x86_64-apple-darwin.tar.gz"
+          UV_ASSET_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+          download_cached "$UV_ASSET_URL" "$CACHE_DIR/$UV_ARCHIVE"
+          tar -xzf "$CACHE_DIR/$UV_ARCHIVE" -C "$TMP_DIR"
+          cp "$TMP_DIR/uv-x86_64-apple-darwin/uv" resources/bin/uv
+          chmod +x resources/bin/uv
+          echo "uv version: $(resources/bin/uv --version)"
+
+          RG_ARCHIVE="ripgrep-${RIPGREP_VERSION}-x86_64-apple-darwin.tar.gz"
+          RG_ASSET_URL="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${RG_ARCHIVE}"
+          download_cached "$RG_ASSET_URL" "$CACHE_DIR/$RG_ARCHIVE"
+          tar -xzf "$CACHE_DIR/$RG_ARCHIVE" -C "$TMP_DIR"
+          RG_DIR="$TMP_DIR/ripgrep-${RIPGREP_VERSION}-x86_64-apple-darwin"
+          cp "$RG_DIR/rg" resources/bin/rg
+          chmod +x resources/bin/rg
+          echo "ripgrep version: $(resources/bin/rg --version | head -n 1)"
+
+      - name: Save macOS x64 runtime downloads
+        if: steps.macos_x64_runtime_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: source/.runtime-cache/macos-x64
+          key: ${{ steps.macos_x64_runtime_cache.outputs.cache-primary-key }}
+
+      - name: Resolve desktop release channel
+        id: release_channel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build desktop (renderer + main)
+        working-directory: source/apps/desktop
+        run: |
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            pnpm run build:release-assets:preview
+          else
+            pnpm run build:release-assets
+          fi
+
+      - name: Read version from package.json
+        id: pkg
+        working-directory: source/apps/desktop
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            APP_VERSION="${VERSION}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            APP_VERSION="$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+          echo "App version: $APP_VERSION"
+
+      - name: Resolve upload channel
+        id: upload
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import signing certificate
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+        run: |
+          CERT_FILE="/tmp/tyclaw-cert.p12"
+          node -e "require('fs').writeFileSync('$CERT_FILE', Buffer.from(process.env.CSC_LINK, 'base64'))"
+
+          KEYCHAIN_FILE="/tmp/tyclaw-build.keychain-db"
+          KEYCHAIN_PASSWORD="actions_build_pw"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security set-keychain-settings "$KEYCHAIN_FILE"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security import "$CERT_FILE" -k "$KEYCHAIN_FILE" -P "" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN_FILE"
+          rm -f "$CERT_FILE"
+
+      - name: Package macOS x64 app
+        working-directory: source/apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            TAILOS_RELEASE_CHANNEL=preview TAILOS_DESKTOP_DEV_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" TAILOS_BUILD_SHA="${{ steps.git_ref.outputs.short_sha }}" pnpm exec electron-builder --config electron-builder.config.cjs --mac zip --x64 --publish never
+          else
+            pnpm exec electron-builder --config electron-builder.config.cjs --mac zip --x64 --publish never
+          fi
+
+      - name: Verify macOS x64 release artifacts
+        working-directory: source/apps/desktop
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          RELEASE_DIR="release/${VERSION}"
+          APP_NAME="${{ steps.release_channel.outputs.desktop_product_name }}"
+          LEGACY_APP_NAME="TyClaw"
+
+          ZIP_FILE=$(find "$RELEASE_DIR" -maxdepth 1 -name '*.zip' | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Expected a macOS zip artifact in $RELEASE_DIR" >&2
+            exit 1
+          fi
+
+          METADATA_FILE="latest-mac.yml"
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            METADATA_FILE="dev-mac.yml"
+          fi
+          if [ ! -f "$RELEASE_DIR/$METADATA_FILE" ]; then
+            echo "Missing $METADATA_FILE in $RELEASE_DIR" >&2
+            exit 1
+          fi
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          unzip -q "$ZIP_FILE" -d "$TMP_DIR"
+
+          APP_BIN=$(
+            find "$TMP_DIR" \
+              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \) \
+              -type f | head -n 1
+          )
+          if [ -z "$APP_BIN" ]; then
+            echo "Unable to find ${APP_NAME} or ${LEGACY_APP_NAME} binary inside $(basename "$ZIP_FILE")" >&2
+            exit 1
+          fi
+          APP_PATH="${APP_BIN%/Contents/MacOS/*}"
+          codesign --verify --deep --strict --verbose=3 "$APP_PATH"
+          spctl --assess --type exec --verbose=3 "$APP_PATH"
+
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/rg" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/rg" \) -type f | grep -q .; then
+            echo "Missing bundled rg in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/bun" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/bun" \) -type f | grep -q .; then
+            echo "Missing bundled bun in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/uv" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/uv" \) -type f | grep -q .; then
+            echo "Missing bundled uv in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/agent-browser" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/agent-browser" \) -type f | grep -q .; then
+            echo "Missing bundled agent-browser in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/agent-browser/skill-data/core/SKILL.md" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/agent-browser/skill-data/core/SKILL.md" \) -type f | grep -q .; then
+            echo "Missing bundled agent-browser skill-data in macOS app resources" >&2
+            exit 1
+          fi
+
+          APP_ARCHS=$(lipo -archs "$APP_BIN")
+          echo "x64 app architectures: $APP_ARCHS"
+          if [[ "$APP_ARCHS" != *"x86_64"* ]]; then
+            echo "Expected x64 binary, got: $APP_ARCHS" >&2
+            exit 1
+          fi
+
+      - name: Upload macOS x64 artifacts to R2
+        working-directory: source/apps/desktop
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          RELEASE_DIR="release/${VERSION}"
+          UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
+          STAGING_DIR=$(mktemp -d)
+          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          MAC_TARGET="${ROOT_TARGET}/macos/x64"
+
+          brew install awscli 2>/dev/null || pip3 install awscli --quiet --break-system-packages
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            aws s3 cp "changelog.yml" "${ROOT_TARGET}/changelog.yml" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          fi
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
+            EXISTING_DEV_FILES=$(aws s3 ls "${MAC_TARGET}/" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              | awk '{print $4}' \
+              | grep -Ei -- '(^|-)dev([.-]|-|$)' \
+              | grep -E '\.(zip|blockmap)$' || true)
+            for existing in $EXISTING_DEV_FILES; do
+              echo "Removing stale dev artifact: $existing"
+              aws s3 rm "${MAC_TARGET}/$existing" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+            done
+          fi
+
+          for f in "$RELEASE_DIR"/*.zip "$RELEASE_DIR"/*.blockmap; do
+            [ -f "$f" ] || continue
+            cp "$f" "$STAGING_DIR/$(basename "$f")"
+          done
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            cp "$RELEASE_DIR"/latest-mac.yml "$STAGING_DIR"/
+          else
+            cp "$RELEASE_DIR"/dev-mac.yml "$STAGING_DIR"/
+          fi
+
+          for f in "$STAGING_DIR"/*; do
+            [ -f "$f" ] || continue
+            echo "Uploading $(basename "$f") to macos/x64..."
+            aws s3 cp "$f" "${MAC_TARGET}/$(basename "$f")" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          done
+
+  build-mac-arm64:
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.os == 'all' || github.event.inputs.os == 'macos-arm64')) ||
+        (github.event_name == 'repository_dispatch' && (github.event.client_payload.os == '' || github.event.client_payload.os == 'all' || github.event.client_payload.os == 'macos-arm64'))
+      }}
+    runs-on: macos-latest
+    steps:
+      - name: Clone source from GitLab
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+          REPO_URL="https://${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}:${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}@gitlab.igora.ai/ty/aure-desktop.git"
+          if [ -n "$TAG" ]; then
+            echo "Cloning tagged source: $TAG"
+            git clone --depth 1 --branch "$TAG" "$REPO_URL" source
+          else
+            echo "No tag provided, cloning default branch HEAD"
+            git clone --depth 1 "$REPO_URL" source
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Read source commit
+        id: git_ref
+        working-directory: source
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Source short SHA: $SHORT_SHA"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Cache Electron binaries
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ~/Library/Caches/electron-builder
+          key: ${{ runner.os }}-electron-${{ hashFiles('source/apps/desktop/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile --filter desktop...
+
+      - name: Build packages
+        working-directory: source
+        run: pnpm --filter 'desktop^...' build
+
+      - name: Fetch tailos runtime (arm64)
+        working-directory: source
+        run: |
+          # 从 tailos-core 的 Release 按 runner 架构拉取预编译 runtime（替代本地 cargo 构建）。
+          node scripts/ensure-tailos-cli.mjs --force
+          test -x apps/desktop/resources/bin/tailos
+          test -x apps/desktop/resources/bin/tailos-python-shim
+          file apps/desktop/resources/bin/tailos*
+
+      - name: Fetch agent-browser (arm64)
+        working-directory: source
+        env:
+          TAILOS_AGENT_BROWSER_TARGET_PLATFORM: darwin
+          TAILOS_AGENT_BROWSER_TARGET_ARCH: arm64
+        run: |
+          node scripts/ensure-agent-browser.mjs --force
+          test -x apps/desktop/resources/bin/agent-browser
+          test -f apps/desktop/resources/agent-browser/skill-data/core/SKILL.md
+          apps/desktop/resources/bin/agent-browser --version
+
+      - name: Restore macOS arm64 runtime downloads
+        id: macos_arm64_runtime_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: source/.runtime-cache/macos-arm64
+          key: ${{ runner.os }}-runtime-macos-arm64-bun-${{ env.BUN_VERSION }}-uv-${{ env.UV_VERSION }}-rg-${{ env.RIPGREP_VERSION }}
+
+      - name: Prepare macOS arm64 runtime binaries
+        working-directory: source/apps/desktop
+        run: |
+          set -euo pipefail
+
+          mkdir -p resources/bin
+          CACHE_DIR="../../.runtime-cache/macos-arm64"
+          mkdir -p "$CACHE_DIR"
+
+          download_cached() {
+            local url="$1"
+            local output="$2"
+
+            if [ -s "$output" ]; then
+              echo "Using cached $(basename "$output")"
+              return
+            fi
+
+            local tmp="${output}.tmp"
+            rm -f "$tmp"
+            echo "Downloading $url"
+
+            local attempt=1
+            local max_attempts=6
+            until curl -fSL --connect-timeout 20 --max-time 300 "$url" -o "$tmp"; do
+              local status=$?
+              rm -f "$tmp"
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Download failed after $attempt attempts: $url" >&2
+                return "$status"
+              fi
+
+              echo "Download failed with exit code $status. Retrying in 10s ($attempt/$max_attempts)..."
+              sleep 10
+              attempt=$((attempt + 1))
+            done
+
+            mv "$tmp" "$output"
+          }
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          BUN_ARCHIVE="bun-darwin-aarch64.zip"
+          BUN_ASSET_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ARCHIVE}"
+          download_cached "$BUN_ASSET_URL" "$CACHE_DIR/$BUN_ARCHIVE"
+          unzip -o "$CACHE_DIR/$BUN_ARCHIVE" -d "$TMP_DIR/bun-extract"
+          cp "$TMP_DIR/bun-extract/bun-darwin-aarch64/bun" resources/bin/bun
+          chmod +x resources/bin/bun
+          echo "bun version: $(resources/bin/bun --version)"
+
+          UV_ARCHIVE="uv-aarch64-apple-darwin.tar.gz"
+          UV_ASSET_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+          download_cached "$UV_ASSET_URL" "$CACHE_DIR/$UV_ARCHIVE"
+          tar -xzf "$CACHE_DIR/$UV_ARCHIVE" -C "$TMP_DIR"
+          cp "$TMP_DIR/uv-aarch64-apple-darwin/uv" resources/bin/uv
+          chmod +x resources/bin/uv
+          echo "uv version: $(resources/bin/uv --version)"
+
+          RG_ARCHIVE="ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin.tar.gz"
+          RG_ASSET_URL="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${RG_ARCHIVE}"
+          download_cached "$RG_ASSET_URL" "$CACHE_DIR/$RG_ARCHIVE"
+          tar -xzf "$CACHE_DIR/$RG_ARCHIVE" -C "$TMP_DIR"
+          RG_DIR="$TMP_DIR/ripgrep-${RIPGREP_VERSION}-aarch64-apple-darwin"
+          cp "$RG_DIR/rg" resources/bin/rg
+          chmod +x resources/bin/rg
+          echo "ripgrep version: $(resources/bin/rg --version | head -n 1)"
+
+      - name: Save macOS arm64 runtime downloads
+        if: steps.macos_arm64_runtime_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: source/.runtime-cache/macos-arm64
+          key: ${{ steps.macos_arm64_runtime_cache.outputs.cache-primary-key }}
+
+      - name: Resolve desktop release channel
+        id: release_channel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build desktop (renderer + main)
+        working-directory: source/apps/desktop
+        run: |
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            pnpm run build:release-assets:preview
+          else
+            pnpm run build:release-assets
+          fi
+
+      - name: Read version from package.json
+        id: pkg
+        working-directory: source/apps/desktop
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            APP_VERSION="${VERSION}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            APP_VERSION="$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+          echo "App version: $APP_VERSION"
+
+      - name: Resolve upload channel
+        id: upload
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import signing certificate
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+        run: |
+          CERT_FILE="/tmp/tyclaw-cert.p12"
+          node -e "require('fs').writeFileSync('$CERT_FILE', Buffer.from(process.env.CSC_LINK, 'base64'))"
+
+          KEYCHAIN_FILE="/tmp/tyclaw-build.keychain-db"
+          KEYCHAIN_PASSWORD="actions_build_pw"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security set-keychain-settings "$KEYCHAIN_FILE"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security import "$CERT_FILE" -k "$KEYCHAIN_FILE" -P "" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_FILE"
+          security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KEYCHAIN_FILE"
+          rm -f "$CERT_FILE"
+
+      - name: Package macOS arm64 app
+        working-directory: source/apps/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            TAILOS_RELEASE_CHANNEL=preview TAILOS_DESKTOP_DEV_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" TAILOS_BUILD_SHA="${{ steps.git_ref.outputs.short_sha }}" pnpm exec electron-builder --config electron-builder.config.cjs --mac zip --arm64 --publish never
+          else
+            pnpm exec electron-builder --config electron-builder.config.cjs --mac zip --arm64 --publish never
+          fi
+
+      - name: Verify macOS arm64 release artifacts
+        working-directory: source/apps/desktop
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          RELEASE_DIR="release/${VERSION}"
+          APP_NAME="${{ steps.release_channel.outputs.desktop_product_name }}"
+          LEGACY_APP_NAME="TyClaw"
+
+          ZIP_FILE=$(find "$RELEASE_DIR" -maxdepth 1 -name '*.zip' | head -n 1)
+          if [ -z "$ZIP_FILE" ]; then
+            echo "Expected a macOS zip artifact in $RELEASE_DIR" >&2
+            exit 1
+          fi
+
+          METADATA_FILE="latest-mac.yml"
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            METADATA_FILE="dev-mac.yml"
+          fi
+          if [ ! -f "$RELEASE_DIR/$METADATA_FILE" ]; then
+            echo "Missing $METADATA_FILE in $RELEASE_DIR" >&2
+            exit 1
+          fi
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+          unzip -q "$ZIP_FILE" -d "$TMP_DIR"
+
+          APP_BIN=$(
+            find "$TMP_DIR" \
+              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \) \
+              -type f | head -n 1
+          )
+          if [ -z "$APP_BIN" ]; then
+            echo "Unable to find ${APP_NAME} or ${LEGACY_APP_NAME} binary inside $(basename "$ZIP_FILE")" >&2
+            exit 1
+          fi
+          APP_PATH="${APP_BIN%/Contents/MacOS/*}"
+          codesign --verify --deep --strict --verbose=3 "$APP_PATH"
+          spctl --assess --type exec --verbose=3 "$APP_PATH"
+
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/rg" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/rg" \) -type f | grep -q .; then
+            echo "Missing bundled rg in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/bun" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/bun" \) -type f | grep -q .; then
+            echo "Missing bundled bun in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/uv" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/uv" \) -type f | grep -q .; then
+            echo "Missing bundled uv in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/agent-browser" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/agent-browser" \) -type f | grep -q .; then
+            echo "Missing bundled agent-browser in macOS app resources" >&2
+            exit 1
+          fi
+          if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/agent-browser/skill-data/core/SKILL.md" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/agent-browser/skill-data/core/SKILL.md" \) -type f | grep -q .; then
+            echo "Missing bundled agent-browser skill-data in macOS app resources" >&2
+            exit 1
+          fi
+
+          APP_ARCHS=$(lipo -archs "$APP_BIN")
+          echo "arm64 app architectures: $APP_ARCHS"
+          if [[ "$APP_ARCHS" != *"arm64"* ]]; then
+            echo "Expected arm64 binary, got: $APP_ARCHS" >&2
+            exit 1
+          fi
+
+      - name: Upload macOS arm64 artifacts to R2
+        working-directory: source/apps/desktop
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          RELEASE_DIR="release/${VERSION}"
+          UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
+          STAGING_DIR=$(mktemp -d)
+          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          MAC_TARGET="${ROOT_TARGET}/macos/arm64"
+
+          brew install awscli 2>/dev/null || pip3 install awscli --quiet --break-system-packages
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            aws s3 cp "changelog.yml" "${ROOT_TARGET}/changelog.yml" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          fi
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
+            EXISTING_DEV_FILES=$(aws s3 ls "${MAC_TARGET}/" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              | awk '{print $4}' \
+              | grep -Ei -- '(^|-)dev([.-]|-|$)' \
+              | grep -E '\.(zip|blockmap)$' || true)
+            for existing in $EXISTING_DEV_FILES; do
+              echo "Removing stale dev artifact: $existing"
+              aws s3 rm "${MAC_TARGET}/$existing" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+            done
+          fi
+
+          for f in "$RELEASE_DIR"/*.zip "$RELEASE_DIR"/*.blockmap; do
+            [ -f "$f" ] || continue
+            cp "$f" "$STAGING_DIR/$(basename "$f")"
+          done
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            cp "$RELEASE_DIR"/latest-mac.yml "$STAGING_DIR"/
+          else
+            cp "$RELEASE_DIR"/dev-mac.yml "$STAGING_DIR"/
+          fi
+
+          for f in "$STAGING_DIR"/*; do
+            [ -f "$f" ] || continue
+            echo "Uploading $(basename "$f") to macos/arm64..."
+            aws s3 cp "$f" "${MAC_TARGET}/$(basename "$f")" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          done
+
+  # Windows stable and preview both build in CI (self-hosted release repo).
+  build-win:
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && (github.event.inputs.os == 'all' || github.event.inputs.os == 'windows-x64')) ||
+        (github.event_name == 'repository_dispatch' && (github.event.client_payload.os == '' || github.event.client_payload.os == 'all' || github.event.client_payload.os == 'windows-x64'))
+      }}
+    runs-on: windows-latest
+    steps:
+      - name: Clone source from GitLab
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $TAG = "${{ github.event.inputs.tag }}"
+          } else {
+            $TAG = "${{ github.event.client_payload.tag }}"
+          }
+          $repoUrl = "https://${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}:${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}@gitlab.igora.ai/ty/aure-desktop.git"
+          if ($TAG) {
+            Write-Host "Cloning tagged source: $TAG"
+            git clone --depth 1 --branch $TAG $repoUrl source
+          } else {
+            Write-Host "No tag provided, cloning default branch HEAD"
+            git clone --depth 1 $repoUrl source
+          }
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Read source commit
+        id: git_ref
+        working-directory: source
+        shell: bash
+        run: |
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "Source short SHA: $SHORT_SHA"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: source/pnpm-lock.yaml
+
+      - name: Cache Electron binaries
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: ${{ runner.os }}-electron-${{ hashFiles('source/apps/desktop/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-electron-
+
+      - name: Install dependencies
+        working-directory: source
+        run: pnpm install --frozen-lockfile --filter desktop...
+
+      - name: Build packages
+        working-directory: source
+        shell: bash
+        run: pnpm --filter 'desktop^...' build
+
+      - name: Fetch tailos runtime
+        working-directory: source
+        shell: bash
+        run: |
+          # 从 tailos-core 的 Release 拉取预编译 runtime（替代本地 cargo 构建）。
+          # win32-x64 归档含全部 4 个二进制（主 CLI + python-shim + 沙箱辅助 bin），解包即得。
+          node scripts/ensure-tailos-cli.mjs --force
+          test -f apps/desktop/resources/bin/tailos.exe
+          test -f apps/desktop/resources/bin/tailos-python-shim.exe
+          test -f apps/desktop/resources/bin/tailos-command-runner.exe
+          test -f apps/desktop/resources/bin/tailos-windows-sandbox-setup.exe
+
+      - name: Fetch agent-browser
+        working-directory: source
+        shell: bash
+        env:
+          TAILOS_AGENT_BROWSER_TARGET_PLATFORM: win32
+          TAILOS_AGENT_BROWSER_TARGET_ARCH: x64
+        run: |
+          node scripts/ensure-agent-browser.mjs --force
+          test -f apps/desktop/resources/bin/agent-browser.exe
+          test -f apps/desktop/resources/agent-browser/skill-data/core/SKILL.md
+          apps/desktop/resources/bin/agent-browser.exe --version
+
+      - name: Inspect tailos.exe runtime dependencies
+        working-directory: source
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = $null
+
+          if (Test-Path $vswhere) {
+            $vsInstallPath = & $vswhere -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+            if ($vsInstallPath) {
+              $dumpbin = Get-ChildItem `
+                (Join-Path $vsInstallPath 'VC\Tools\MSVC') `
+                -Recurse -Filter dumpbin.exe `
+                -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } |
+                Select-Object -First 1 -ExpandProperty FullName
+            }
+          }
+
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem `
+              "${env:ProgramFiles(x86)}\Microsoft Visual Studio" `
+              "${env:ProgramFiles}\Microsoft Visual Studio" `
+              -Recurse -Filter dumpbin.exe `
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'Hostx64\\x64\\dumpbin\.exe$' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (-not $dumpbin) {
+            Write-Warning "dumpbin.exe not found, skipping dependency inspection"
+            exit 0
+          }
+
+          Write-Host "Using dumpbin: $dumpbin"
+          & $dumpbin /DEPENDENTS "apps\desktop\resources\bin\tailos.exe"
+
+      - name: Restore Windows x64 runtime downloads
+        id: windows_x64_runtime_cache
+        uses: actions/cache/restore@v5
+        with:
+          path: source/.runtime-cache/windows-x64
+          key: ${{ runner.os }}-runtime-windows-x64-bun-${{ env.BUN_VERSION }}-uv-${{ env.UV_VERSION }}-rg-${{ env.RIPGREP_VERSION }}-py-${{ env.PYTHON_STANDALONE_VERSION }}
+
+      - name: Prepare Windows x64 runtime binaries
+        working-directory: source/apps/desktop
+        shell: bash
+        env:
+          PYTHON_SERIES: ${{ env.PYTHON_STANDALONE_VERSION }}
+          PYTHON_TARGET: x86_64-pc-windows-msvc
+          PYTHON_PLATFORM: windows-x64
+          PYTHON_ENTRY: python.exe
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p resources/bin
+          rm -rf resources/runtime/python
+          mkdir -p resources/runtime/python
+
+          CACHE_DIR="../../.runtime-cache/windows-x64"
+          mkdir -p "$CACHE_DIR"
+
+          download_cached() {
+            local url="$1"
+            local output="$2"
+
+            if [ -s "$output" ]; then
+              echo "Using cached $(basename "$output")"
+              return
+            fi
+
+            local tmp="${output}.tmp"
+            rm -f "$tmp"
+            echo "Downloading $url"
+
+            local attempt=1
+            local max_attempts=6
+            until curl -fSL --connect-timeout 20 --max-time 300 "$url" -o "$tmp"; do
+              local status=$?
+              rm -f "$tmp"
+
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "Download failed after $attempt attempts: $url" >&2
+                return "$status"
+              fi
+
+              echo "Download failed with exit code $status. Retrying in 10s ($attempt/$max_attempts)..."
+              sleep 10
+              attempt=$((attempt + 1))
+            done
+
+            mv "$tmp" "$output"
+          }
+
+          TMP_DIR=$(mktemp -d)
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          BUN_ARCHIVE="bun-windows-x64.zip"
+          BUN_ASSET_URL="https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/${BUN_ARCHIVE}"
+          download_cached "$BUN_ASSET_URL" "$CACHE_DIR/$BUN_ARCHIVE"
+          unzip -o "$CACHE_DIR/$BUN_ARCHIVE" -d "$TMP_DIR/bun-extract"
+          cp "$TMP_DIR/bun-extract/bun-windows-x64/bun.exe" resources/bin/bun.exe
+          echo "bun downloaded: $(ls -lh resources/bin/bun.exe)"
+          resources/bin/bun.exe --version
+
+          UV_ARCHIVE="uv-x86_64-pc-windows-msvc.zip"
+          UV_ASSET_URL="https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/${UV_ARCHIVE}"
+          download_cached "$UV_ASSET_URL" "$CACHE_DIR/$UV_ARCHIVE"
+          unzip -o "$CACHE_DIR/$UV_ARCHIVE" -d "$TMP_DIR/uv-extract"
+          cp "$TMP_DIR/uv-extract/uv.exe" resources/bin/uv.exe
+          echo "uv downloaded: $(ls -lh resources/bin/uv.exe)"
+          resources/bin/uv.exe --version
+
+          RG_ARCHIVE="ripgrep-${RIPGREP_VERSION}-x86_64-pc-windows-msvc.zip"
+          RG_ASSET_URL="https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/${RG_ARCHIVE}"
+          download_cached "$RG_ASSET_URL" "$CACHE_DIR/$RG_ARCHIVE"
+          unzip -o "$CACHE_DIR/$RG_ARCHIVE" -d "$TMP_DIR/rg-extract"
+          RG_DIR="$TMP_DIR/rg-extract/ripgrep-${RIPGREP_VERSION}-x86_64-pc-windows-msvc"
+          cp "$RG_DIR/rg.exe" resources/bin/rg.exe
+          echo "ripgrep downloaded: $(ls -lh resources/bin/rg.exe)"
+
+          ASSET_URL=$(gh release view --repo astral-sh/python-build-standalone --json assets -q ".assets[] | select(.name | startswith(\"cpython-$PYTHON_SERIES+\")) | select(.name | endswith(\"-$PYTHON_TARGET-install_only.tar.gz\")) | .url" | head -n 1)
+          if [ -z "$ASSET_URL" ]; then
+            echo "Unable to find python-build-standalone asset for $PYTHON_SERIES / $PYTHON_TARGET" >&2
+            exit 1
+          fi
+          PYTHON_ARCHIVE="python-${PYTHON_SERIES}-${PYTHON_TARGET}-install_only.tar.gz"
+          download_cached "$ASSET_URL" "$CACHE_DIR/$PYTHON_ARCHIVE"
+          tar -xzf "$CACHE_DIR/$PYTHON_ARCHIVE" --strip-components=1 -C resources/runtime/python
+          PYTHON_VERSION=$(resources/runtime/python/python.exe --version 2>&1 | awk '{print $2}')
+          python - "$PYTHON_VERSION" "$PYTHON_PLATFORM" "$PYTHON_ENTRY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          version, platform, entry = sys.argv[1:4]
+          Path("resources/runtime/python/runtime.json").write_text(
+              json.dumps(
+                  {
+                      "name": "python",
+                      "implementation": "cpython",
+                      "version": version,
+                      "platform": platform,
+                      "entry": entry,
+                      "managed_by": "tyclaw-release",
+                      "layout_version": 1,
+                  },
+                  indent=2,
+              ) + "\n"
+          )
+          PY
+          resources/runtime/python/python.exe --version
+
+      - name: Save Windows x64 runtime downloads
+        if: steps.windows_x64_runtime_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: source/.runtime-cache/windows-x64
+          key: ${{ steps.windows_x64_runtime_cache.outputs.cache-primary-key }}
+
+      - name: Resolve desktop release channel
+        id: release_channel
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+          else
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build desktop (renderer + main)
+        working-directory: source/apps/desktop
+        run: |
+          if ("${{ steps.release_channel.outputs.desktop_channel }}" -eq "preview") {
+            pnpm run build:release-assets:preview
+          } else {
+            pnpm run build:release-assets
+          }
+
+      - name: Read version from package.json
+        id: pkg
+        working-directory: source/apps/desktop
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            APP_VERSION="${VERSION}-dev.${GITHUB_RUN_NUMBER}"
+          else
+            APP_VERSION="$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Package version: $VERSION"
+          echo "App version: $APP_VERSION"
+
+      - name: Resolve upload channel
+        id: upload
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.event.client_payload.tag }}"
+          fi
+
+          if [ -n "$TAG" ]; then
+            echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
+          else
+            echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
+            echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
+            echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Windows app
+        working-directory: source/apps/desktop
+        shell: bash
+        run: |
+          if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
+            TAILOS_RELEASE_CHANNEL=preview TAILOS_DESKTOP_DEV_BUILD_NUMBER="${GITHUB_RUN_NUMBER}" TAILOS_BUILD_SHA="${{ steps.git_ref.outputs.short_sha }}" pnpm exec electron-builder --config electron-builder.config.cjs --win --publish never
+          else
+            pnpm exec electron-builder --config electron-builder.config.cjs --win --publish never
+          fi
+
+      - name: Smoke test Windows unpacked app
+        working-directory: source/apps/desktop
+        shell: bash
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          APP_EXE=$(
+            find "release/${VERSION}" \
+              -path '*/win-unpacked/*.exe' \
+              -type f | head -n 1
+          )
+          if [ -z "$APP_EXE" ]; then
+            echo "Unable to find Windows app executable under release/${VERSION}" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/rg.exe' -type f | grep -q .; then
+            echo "Missing bundled rg.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/bun.exe' -type f | grep -q .; then
+            echo "Missing bundled bun.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/uv.exe' -type f | grep -q .; then
+            echo "Missing bundled uv.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/agent-browser.exe' -type f | grep -q .; then
+            echo "Missing bundled agent-browser.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/agent-browser/skill-data/core/SKILL.md' -type f | grep -q .; then
+            echo "Missing bundled agent-browser skill-data in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/tailos-command-runner.exe' -type f | grep -q .; then
+            echo "Missing bundled tailos-command-runner.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! find "release/${VERSION}" -path '*/win-unpacked/resources/bin/tailos-windows-sandbox-setup.exe' -type f | grep -q .; then
+            echo "Missing bundled tailos-windows-sandbox-setup.exe in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          APP_UPDATE_YML=$(find "release/${VERSION}" -path '*/win-unpacked/resources/app-update.yml' -type f | head -n 1)
+          if [ -z "$APP_UPDATE_YML" ]; then
+            echo "Missing app-update.yml in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          if ! grep -q 'provider: generic' "$APP_UPDATE_YML"; then
+            echo "app-update.yml does not contain generic provider config" >&2
+            exit 1
+          fi
+          BUNDLED_PYTHON=$(find "release/${VERSION}" -path '*/win-unpacked/resources/runtime/python/python.exe' -type f | head -n 1)
+          if [ -z "$BUNDLED_PYTHON" ]; then
+            echo "Missing bundled Python runtime in Windows unpacked app resources" >&2
+            exit 1
+          fi
+          "$BUNDLED_PYTHON" --version
+          node scripts/smoke-test-app.mjs "$APP_EXE"
+
+      - name: Prepare changelog
+        working-directory: source/apps/desktop
+        shell: bash
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          mkdir -p "release/${VERSION}"
+          cp changelog.yml "release/${VERSION}/"
+
+      - name: Upload to R2
+        working-directory: source/apps/desktop
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          VERSION="${{ steps.pkg.outputs.app_version }}"
+          RELEASE_DIR="release/${VERSION}"
+          UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
+          ARTIFACT_PRODUCT_NAME="${{ steps.upload.outputs.desktop_artifact_product_name }}"
+          STAGING_DIR=$(mktemp -d)
+          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          WIN_TARGET="${ROOT_TARGET}/windows/x64"
+
+          pip3 install awscli --quiet
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            aws s3 cp "$RELEASE_DIR/changelog.yml" "${ROOT_TARGET}/changelog.yml" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          fi
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
+            EXISTING_DEV_FILES=$(aws s3 ls "${WIN_TARGET}/" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              | awk '{print $4}' \
+              | grep -Ei -- '(^|-)dev([.-]|-|$)' \
+              | grep -E '\.(exe|blockmap)$' || true)
+            for existing in $EXISTING_DEV_FILES; do
+              echo "Removing stale dev artifact: $existing"
+              aws s3 rm "${WIN_TARGET}/$existing" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+            done
+          fi
+
+          for f in "$RELEASE_DIR"/*.exe "$RELEASE_DIR"/*.blockmap; do
+            [ -f "$f" ] || continue
+            BASENAME=$(basename "$f")
+            if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+              EXPECTED_PREFIX="${ARTIFACT_PRODUCT_NAME}-Windows-${VERSION}-Setup.exe"
+            else
+              EXPECTED_PREFIX="${ARTIFACT_PRODUCT_NAME}-${VERSION}-win-x64.exe"
+            fi
+            if [[ "$BASENAME" != "$EXPECTED_PREFIX"* ]]; then
+              echo "Skipping non-${ARTIFACT_PRODUCT_NAME} Windows artifact: $BASENAME"
+              continue
+            fi
+            cp "$f" "$STAGING_DIR/$BASENAME"
+          done
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            EXPECTED_INSTALLER="${ARTIFACT_PRODUCT_NAME}-Windows-${UPLOAD_VERSION}-Setup.exe"
+          else
+            EXPECTED_INSTALLER="${ARTIFACT_PRODUCT_NAME}-${UPLOAD_VERSION}-win-x64.exe"
+          fi
+
+          if ! find "$STAGING_DIR" -maxdepth 1 -name "$EXPECTED_INSTALLER" -type f | grep -q .; then
+            echo "Missing staged ${ARTIFACT_PRODUCT_NAME} Windows installer for upload version ${UPLOAD_VERSION}" >&2
+            echo "Release directory contents:" >&2
+            find "$RELEASE_DIR" -maxdepth 1 -type f -exec basename {} \; >&2
+            exit 1
+          fi
+          STAGED_INSTALLER="$EXPECTED_INSTALLER"
+          echo "Staged Windows installer: $STAGED_INSTALLER"
+
+          if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
+            cp "$RELEASE_DIR"/latest.yml "$STAGING_DIR"/
+          else
+            cp "$RELEASE_DIR"/dev.yml "$STAGING_DIR"/
+          fi
+
+          for f in "$STAGING_DIR"/*; do
+            [ -f "$f" ] || continue
+            echo "Uploading $(basename "$f") to windows/x64..."
+            aws s3 cp "$f" "${WIN_TARGET}/$(basename "$f")" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+          done
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [build-mac-x64, build-mac-arm64, build-win]
+    if: >-
+      ${{
+        always() &&
+        (
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.tag) ||
+          (github.event_name == 'repository_dispatch' && github.event.client_payload.tag)
+        ) &&
+        contains(fromJSON('["success","skipped"]'), needs.build-mac-x64.result) &&
+        contains(fromJSON('["success","skipped"]'), needs.build-mac-arm64.result) &&
+        contains(fromJSON('["success","skipped"]'), needs.build-win.result) &&
+        (needs.build-mac-x64.result == 'success' || needs.build-mac-arm64.result == 'success' || needs.build-win.result == 'success')
+      }}
+    steps:
+      - name: Clean old versions on R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+        run: |
+          pip3 install awscli --quiet
+
+          clean_mac_dir() {
+            local prefix="$1"
+            local zips
+            local count
+            zips=$(aws s3 ls "s3://${R2_BUCKET}/${prefix}/" \
+              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              | grep '\.zip$' | grep -v '\.blockmap' | grep -Evi -- '(^|-)dev([.-]|-|$)' | sort -k1,1r -k2,2r | awk '{print $4}')
+            count=0
+            for zip in $zips; do
+              count=$((count + 1))
+              if [ $count -gt "$R2_STABLE_RELEASES_TO_KEEP" ]; then
+                echo "Deleting old macOS artifact: ${prefix}/$zip"
+                aws s3 rm "s3://${R2_BUCKET}/${prefix}/$zip" \
+                  --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+                aws s3 rm "s3://${R2_BUCKET}/${prefix}/${zip}.blockmap" \
+                  --endpoint-url "${{ secrets.R2_ENDPOINT }}" 2>/dev/null || true
+              fi
+            done
+          }
+
+          clean_mac_dir "${R2_RELEASE_PREFIX}/macos/x64"
+          clean_mac_dir "${R2_RELEASE_PREFIX}/macos/arm64"
+
+          EXES=$(aws s3 ls "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/" \
+            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+            | grep '\.exe$' | grep -v '\.blockmap' | grep -Evi -- '(^|-)dev([.-]|-|$)' | sort -k1,1r -k2,2r | awk '{print $4}')
+          COUNT=0
+          for exe in $EXES; do
+            COUNT=$((COUNT + 1))
+            if [ $COUNT -gt "$R2_STABLE_RELEASES_TO_KEEP" ]; then
+              echo "Deleting old Windows artifact: windows/x64/$exe"
+              aws s3 rm "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/$exe" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              aws s3 rm "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/${exe}.blockmap" \
+                --endpoint-url "${{ secrets.R2_ENDPOINT }}" 2>/dev/null || true
+            fi
+          done
