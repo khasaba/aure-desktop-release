@@ -376,7 +376,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
           AWS_DEFAULT_REGION: cn-north-1
           AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
-          AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -759,7 +758,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
           AWS_DEFAULT_REGION: cn-north-1
           AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
-          AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -1210,7 +1208,6 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
           AWS_DEFAULT_REGION: cn-north-1
           AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
-          AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
