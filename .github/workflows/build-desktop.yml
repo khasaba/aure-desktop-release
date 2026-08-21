@@ -21,17 +21,18 @@ on:
         type: string
 
 env:
+  # Object storage: Qiniu Kodo (S3-compatible). Public CDN: crm-cdn.joywo.net
   PNPM_VERSION: "9.15.0"
   NODE_VERSION: "22"
   PYTHON_STANDALONE_VERSION: "3.12.13"
   BUN_VERSION: "1.3.13"
   UV_VERSION: "0.11.8"
   RIPGREP_VERSION: "15.1.0"
-  R2_BUCKET: "files"
-  R2_RELEASE_PREFIX: "releases/tyclaw"
+  QINIU_BUCKET: "jiuwo-crm"
+  RELEASE_PREFIX: "releases/aureink"
   # Current three-platform stable artifacts are about 645MB per version.
   # Keep 12 versions to stay below 10GB with room for package growth.
-  R2_STABLE_RELEASES_TO_KEEP: "12"
+  STABLE_RELEASES_TO_KEEP: "12"
 
 jobs:
   build-mac-x64:
@@ -372,34 +373,35 @@ jobs:
       - name: Upload macOS x64 artifacts to R2
         working-directory: source/apps/desktop
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: cn-north-1
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
           UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
           STAGING_DIR=$(mktemp -d)
-          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          ROOT_TARGET="s3://${QINIU_BUCKET}/${RELEASE_PREFIX}"
           MAC_TARGET="${ROOT_TARGET}/macos/x64"
 
           brew install awscli 2>/dev/null || pip3 install awscli --quiet --break-system-packages
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
             aws s3 cp "changelog.yml" "${ROOT_TARGET}/changelog.yml" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           fi
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
             EXISTING_DEV_FILES=$(aws s3 ls "${MAC_TARGET}/" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" \
               | awk '{print $4}' \
               | grep -Ei -- '(^|-)dev([.-]|-|$)' \
               | grep -E '\.(zip|blockmap)$' || true)
             for existing in $EXISTING_DEV_FILES; do
               echo "Removing stale dev artifact: $existing"
               aws s3 rm "${MAC_TARGET}/$existing" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+                --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
             done
           fi
 
@@ -418,7 +420,7 @@ jobs:
             [ -f "$f" ] || continue
             echo "Uploading $(basename "$f") to macos/x64..."
             aws s3 cp "$f" "${MAC_TARGET}/$(basename "$f")" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           done
 
   build-mac-arm64:
@@ -754,34 +756,35 @@ jobs:
       - name: Upload macOS arm64 artifacts to R2
         working-directory: source/apps/desktop
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: cn-north-1
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
           UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
           STAGING_DIR=$(mktemp -d)
-          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          ROOT_TARGET="s3://${QINIU_BUCKET}/${RELEASE_PREFIX}"
           MAC_TARGET="${ROOT_TARGET}/macos/arm64"
 
           brew install awscli 2>/dev/null || pip3 install awscli --quiet --break-system-packages
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
             aws s3 cp "changelog.yml" "${ROOT_TARGET}/changelog.yml" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           fi
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
             EXISTING_DEV_FILES=$(aws s3 ls "${MAC_TARGET}/" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" \
               | awk '{print $4}' \
               | grep -Ei -- '(^|-)dev([.-]|-|$)' \
               | grep -E '\.(zip|blockmap)$' || true)
             for existing in $EXISTING_DEV_FILES; do
               echo "Removing stale dev artifact: $existing"
               aws s3 rm "${MAC_TARGET}/$existing" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+                --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
             done
           fi
 
@@ -800,7 +803,7 @@ jobs:
             [ -f "$f" ] || continue
             echo "Uploading $(basename "$f") to macos/arm64..."
             aws s3 cp "$f" "${MAC_TARGET}/$(basename "$f")" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           done
 
   # Windows stable and preview both build in CI (self-hosted release repo).
@@ -1204,8 +1207,9 @@ jobs:
         working-directory: source/apps/desktop
         shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: cn-north-1
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
           AWS_DEFAULT_REGION: auto
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
@@ -1213,26 +1217,26 @@ jobs:
           UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
           ARTIFACT_PRODUCT_NAME="${{ steps.upload.outputs.desktop_artifact_product_name }}"
           STAGING_DIR=$(mktemp -d)
-          ROOT_TARGET="s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}"
+          ROOT_TARGET="s3://${QINIU_BUCKET}/${RELEASE_PREFIX}"
           WIN_TARGET="${ROOT_TARGET}/windows/x64"
 
           pip3 install awscli --quiet
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" = "true" ]; then
             aws s3 cp "$RELEASE_DIR/changelog.yml" "${ROOT_TARGET}/changelog.yml" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           fi
 
           if [ "${{ steps.upload.outputs.explicit_tag }}" != "true" ]; then
             EXISTING_DEV_FILES=$(aws s3 ls "${WIN_TARGET}/" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" \
               | awk '{print $4}' \
               | grep -Ei -- '(^|-)dev([.-]|-|$)' \
               | grep -E '\.(exe|blockmap)$' || true)
             for existing in $EXISTING_DEV_FILES; do
               echo "Removing stale dev artifact: $existing"
               aws s3 rm "${WIN_TARGET}/$existing" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+                --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
             done
           fi
 
@@ -1276,7 +1280,7 @@ jobs:
             [ -f "$f" ] || continue
             echo "Uploading $(basename "$f") to windows/x64..."
             aws s3 cp "$f" "${WIN_TARGET}/$(basename "$f")" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}"
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
           done
 
   cleanup:
@@ -1295,11 +1299,11 @@ jobs:
         (needs.build-mac-x64.result == 'success' || needs.build-mac-arm64.result == 'success' || needs.build-win.result == 'success')
       }}
     steps:
-      - name: Clean old versions on R2
+      - name: Clean old versions on Qiniu
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
+          AWS_ACCESS_KEY_ID: ${{ secrets.QINIU_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          AWS_DEFAULT_REGION: cn-north-1
         run: |
           pip3 install awscli --quiet
 
@@ -1307,36 +1311,66 @@ jobs:
             local prefix="$1"
             local zips
             local count
-            zips=$(aws s3 ls "s3://${R2_BUCKET}/${prefix}/" \
-              --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+            zips=$(aws s3 ls "s3://${QINIU_BUCKET}/${prefix}/" \
+              --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" \
               | grep '\.zip$' | grep -v '\.blockmap' | grep -Evi -- '(^|-)dev([.-]|-|$)' | sort -k1,1r -k2,2r | awk '{print $4}')
             count=0
             for zip in $zips; do
               count=$((count + 1))
-              if [ $count -gt "$R2_STABLE_RELEASES_TO_KEEP" ]; then
+              if [ $count -gt "$STABLE_RELEASES_TO_KEEP" ]; then
                 echo "Deleting old macOS artifact: ${prefix}/$zip"
-                aws s3 rm "s3://${R2_BUCKET}/${prefix}/$zip" \
-                  --endpoint-url "${{ secrets.R2_ENDPOINT }}"
-                aws s3 rm "s3://${R2_BUCKET}/${prefix}/${zip}.blockmap" \
-                  --endpoint-url "${{ secrets.R2_ENDPOINT }}" 2>/dev/null || true
+                aws s3 rm "s3://${QINIU_BUCKET}/${prefix}/$zip" \
+                  --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
+                aws s3 rm "s3://${QINIU_BUCKET}/${prefix}/${zip}.blockmap" \
+                  --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" 2>/dev/null || true
               fi
             done
           }
 
-          clean_mac_dir "${R2_RELEASE_PREFIX}/macos/x64"
-          clean_mac_dir "${R2_RELEASE_PREFIX}/macos/arm64"
+          clean_mac_dir "${RELEASE_PREFIX}/macos/x64"
+          clean_mac_dir "${RELEASE_PREFIX}/macos/arm64"
 
-          EXES=$(aws s3 ls "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/" \
-            --endpoint-url "${{ secrets.R2_ENDPOINT }}" \
+          EXES=$(aws s3 ls "s3://${QINIU_BUCKET}/${RELEASE_PREFIX}/windows/x64/" \
+            --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" \
             | grep '\.exe$' | grep -v '\.blockmap' | grep -Evi -- '(^|-)dev([.-]|-|$)' | sort -k1,1r -k2,2r | awk '{print $4}')
           COUNT=0
           for exe in $EXES; do
             COUNT=$((COUNT + 1))
-            if [ $COUNT -gt "$R2_STABLE_RELEASES_TO_KEEP" ]; then
+            if [ $COUNT -gt "$STABLE_RELEASES_TO_KEEP" ]; then
               echo "Deleting old Windows artifact: windows/x64/$exe"
-              aws s3 rm "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/$exe" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}"
-              aws s3 rm "s3://${R2_BUCKET}/${R2_RELEASE_PREFIX}/windows/x64/${exe}.blockmap" \
-                --endpoint-url "${{ secrets.R2_ENDPOINT }}" 2>/dev/null || true
+              aws s3 rm "s3://${QINIU_BUCKET}/${RELEASE_PREFIX}/windows/x64/$exe" \
+                --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}"
+              aws s3 rm "s3://${QINIU_BUCKET}/${RELEASE_PREFIX}/windows/x64/${exe}.blockmap" \
+                --endpoint-url "${{ secrets.QINIU_S3_ENDPOINT }}" 2>/dev/null || true
             fi
           done
+
+  refresh-cdn:
+    name: Refresh Qiniu CDN
+    needs:
+      - build-mac-x64
+      - build-mac-arm64
+      - build-win
+    if: always() && (needs.build-mac-x64.result == 'success' || needs.build-mac-arm64.result == 'success' || needs.build-win.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Install qiniu SDK
+        run: npm install --no-save qiniu@7
+      - name: Refresh release metadata URLs
+        env:
+          QINIU_ACCESS_KEY: ${{ secrets.QINIU_ACCESS_KEY }}
+          QINIU_SECRET_KEY: ${{ secrets.QINIU_SECRET_KEY }}
+          CDN: ${{ secrets.QINIU_CDN_BASE_URL }}
+        run: |
+          CDN="${CDN:-https://crm-cdn.joywo.net}"
+          CDN="${CDN%/}"
+          node scripts/refresh-cdn.mjs \
+            "$CDN/${RELEASE_PREFIX}/changelog.yml" \
+            "$CDN/${RELEASE_PREFIX}/macos/arm64/latest-mac.yml" \
+            "$CDN/${RELEASE_PREFIX}/macos/x64/latest-mac.yml" \
+            "$CDN/${RELEASE_PREFIX}/windows/x64/latest.yml"
+
