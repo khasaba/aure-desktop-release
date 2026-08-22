@@ -4,6 +4,9 @@
  * Env: QINIU_ACCESS_KEY, QINIU_SECRET_KEY
  * Args: absolute https URLs
  */
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
 const qiniu = require("qiniu");
 
 const accessKey = process.env.QINIU_ACCESS_KEY;
