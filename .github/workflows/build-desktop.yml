@@ -224,6 +224,9 @@ jobs:
 
       - name: Build desktop (renderer + main)
         working-directory: source/apps/desktop
+        env:
+          GITLAB_DEPLOY_TOKEN_USER: ${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}
+          GITLAB_DEPLOY_TOKEN_PASS: ${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}
         run: |
           if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
             pnpm run build:release-assets:preview
@@ -298,6 +301,7 @@ jobs:
       - name: Package macOS x64 app
         working-directory: source/apps/desktop
         env:
+          CI: false
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_IDENTITY_AUTO_DISCOVERY || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -613,6 +617,9 @@ jobs:
 
       - name: Build desktop (renderer + main)
         working-directory: source/apps/desktop
+        env:
+          GITLAB_DEPLOY_TOKEN_USER: ${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}
+          GITLAB_DEPLOY_TOKEN_PASS: ${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}
         run: |
           if [ "${{ steps.release_channel.outputs.desktop_channel }}" = "preview" ]; then
             pnpm run build:release-assets:preview
@@ -687,6 +694,7 @@ jobs:
       - name: Package macOS arm64 app
         working-directory: source/apps/desktop
         env:
+          CI: false
           CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_IDENTITY_AUTO_DISCOVERY || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -1091,6 +1099,10 @@ jobs:
 
       - name: Build desktop (renderer + main)
         working-directory: source/apps/desktop
+        shell: pwsh
+        env:
+          GITLAB_DEPLOY_TOKEN_USER: ${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}
+          GITLAB_DEPLOY_TOKEN_PASS: ${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}
         run: |
           if ("${{ steps.release_channel.outputs.desktop_channel }}" -eq "preview") {
             pnpm run build:release-assets:preview
