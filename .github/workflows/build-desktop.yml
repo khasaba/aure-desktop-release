@@ -24,7 +24,7 @@ env:
   # Object storage: Qiniu Kodo (S3-compatible). Public CDN: crm-cdn.joywo.net
   PNPM_VERSION: "9.15.0"
   NODE_VERSION: "22"
-  PYTHON_STANDALONE_VERSION: "3.12.13"
+  PYTHON_STANDALONE_VERSION: "3.12.14"
   BUN_VERSION: "1.3.13"
   UV_VERSION: "0.11.8"
   RIPGREP_VERSION: "15.1.0"
@@ -269,10 +269,16 @@ jobs:
             echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Import signing certificate
+      - name: Configure macOS code signing
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
         run: |
+          if [ -z "${CSC_LINK:-}" ]; then
+            echo "MAC_CSC_LINK not set — building unsigned macOS artifacts"
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
           CERT_FILE="/tmp/tyclaw-cert.p12"
           node -e "require('fs').writeFileSync('$CERT_FILE', Buffer.from(process.env.CSC_LINK, 'base64'))"
 
@@ -287,11 +293,12 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$KEYCHAIN_FILE"
           rm -f "$CERT_FILE"
+          echo "CSC_IDENTITY_AUTO_DISCOVERY=true" >> "$GITHUB_ENV"
 
       - name: Package macOS x64 app
         working-directory: source/apps/desktop
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_IDENTITY_AUTO_DISCOVERY || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -651,10 +658,16 @@ jobs:
             echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Import signing certificate
+      - name: Configure macOS code signing
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
         run: |
+          if [ -z "${CSC_LINK:-}" ]; then
+            echo "MAC_CSC_LINK not set — building unsigned macOS artifacts"
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
           CERT_FILE="/tmp/tyclaw-cert.p12"
           node -e "require('fs').writeFileSync('$CERT_FILE', Buffer.from(process.env.CSC_LINK, 'base64'))"
 
@@ -669,11 +682,12 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_FILE" $(security list-keychains -d user | tr -d '"')
           security find-identity -v -p codesigning "$KEYCHAIN_FILE"
           rm -f "$CERT_FILE"
+          echo "CSC_IDENTITY_AUTO_DISCOVERY=true" >> "$GITHUB_ENV"
 
       - name: Package macOS arm64 app
         working-directory: source/apps/desktop
         env:
-          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ env.CSC_IDENTITY_AUTO_DISCOVERY || 'false' }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
