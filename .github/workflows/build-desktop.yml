@@ -216,10 +216,10 @@ jobs:
 
           if [ -n "$TAG" ]; then
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build desktop (renderer + main)
@@ -262,13 +262,13 @@ jobs:
             echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
@@ -315,6 +315,8 @@ jobs:
 
       - name: Verify macOS x64 release artifacts
         working-directory: source/apps/desktop
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -342,16 +344,23 @@ jobs:
 
           APP_BIN=$(
             find "$TMP_DIR" \
-              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \) \
+              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" \
+                 -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \
+                 -o -path "*/Trio Mate.app/Contents/MacOS/Trio Mate" \
+                 -o -path "*/Mate.app/Contents/MacOS/Mate" \) \
               -type f | head -n 1
           )
           if [ -z "$APP_BIN" ]; then
-            echo "Unable to find ${APP_NAME} or ${LEGACY_APP_NAME} binary inside $(basename "$ZIP_FILE")" >&2
+            echo "Unable to find app binary inside $(basename "$ZIP_FILE")" >&2
             exit 1
           fi
           APP_PATH="${APP_BIN%/Contents/MacOS/*}"
-          codesign --verify --deep --strict --verbose=3 "$APP_PATH"
-          spctl --assess --type exec --verbose=3 "$APP_PATH"
+          if [ -n "${MAC_CSC_LINK:-}" ]; then
+            codesign --verify --deep --strict --verbose=3 "$APP_PATH"
+            spctl --assess --type exec --verbose=3 "$APP_PATH"
+          else
+            echo "Skipping signature verification (unsigned build)"
+          fi
 
           if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/rg" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/rg" \) -type f | grep -q .; then
             echo "Missing bundled rg in macOS app resources" >&2
@@ -609,10 +618,10 @@ jobs:
 
           if [ -n "$TAG" ]; then
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build desktop (renderer + main)
@@ -655,13 +664,13 @@ jobs:
             echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
@@ -708,6 +717,8 @@ jobs:
 
       - name: Verify macOS arm64 release artifacts
         working-directory: source/apps/desktop
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -735,16 +746,23 @@ jobs:
 
           APP_BIN=$(
             find "$TMP_DIR" \
-              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \) \
+              \( -path "*/${APP_NAME}.app/Contents/MacOS/${APP_NAME}" \
+                 -o -path "*/${LEGACY_APP_NAME}.app/Contents/MacOS/${LEGACY_APP_NAME}" \
+                 -o -path "*/Trio Mate.app/Contents/MacOS/Trio Mate" \
+                 -o -path "*/Mate.app/Contents/MacOS/Mate" \) \
               -type f | head -n 1
           )
           if [ -z "$APP_BIN" ]; then
-            echo "Unable to find ${APP_NAME} or ${LEGACY_APP_NAME} binary inside $(basename "$ZIP_FILE")" >&2
+            echo "Unable to find app binary inside $(basename "$ZIP_FILE")" >&2
             exit 1
           fi
           APP_PATH="${APP_BIN%/Contents/MacOS/*}"
-          codesign --verify --deep --strict --verbose=3 "$APP_PATH"
-          spctl --assess --type exec --verbose=3 "$APP_PATH"
+          if [ -n "${MAC_CSC_LINK:-}" ]; then
+            codesign --verify --deep --strict --verbose=3 "$APP_PATH"
+            spctl --assess --type exec --verbose=3 "$APP_PATH"
+          else
+            echo "Skipping signature verification (unsigned build)"
+          fi
 
           if ! find "$TMP_DIR" \( -path "*/${APP_NAME}.app/Contents/Resources/bin/rg" -o -path "*/${LEGACY_APP_NAME}.app/Contents/Resources/bin/rg" \) -type f | grep -q .; then
             echo "Missing bundled rg in macOS app resources" >&2
@@ -845,10 +863,10 @@ jobs:
           $repoUrl = "https://${{ secrets.GITLAB_DEPLOY_TOKEN_USER }}:${{ secrets.GITLAB_DEPLOY_TOKEN_PASS }}@gitlab.igora.ai/ty/aure-desktop.git"
           if ($TAG) {
             Write-Host "Cloning tagged source: $TAG"
-            git clone --depth 1 --branch $TAG $repoUrl source
+            git -c core.autocrlf=false clone --depth 1 --branch $TAG $repoUrl source
           } else {
             Write-Host "No tag provided, cloning default branch HEAD"
-            git clone --depth 1 $repoUrl source
+            git -c core.autocrlf=false clone --depth 1 $repoUrl source
           }
 
       - name: Setup pnpm
@@ -1091,10 +1109,10 @@ jobs:
 
           if [ -n "$TAG" ]; then
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build desktop (renderer + main)
@@ -1140,13 +1158,13 @@ jobs:
             echo "artifact_version=${{ steps.pkg.outputs.version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=true" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=prod" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink" >> "$GITHUB_OUTPUT"
           else
             echo "artifact_version=${{ steps.pkg.outputs.app_version }}" >> "$GITHUB_OUTPUT"
             echo "explicit_tag=false" >> "$GITHUB_OUTPUT"
             echo "desktop_channel=preview" >> "$GITHUB_OUTPUT"
-            echo "desktop_product_name=Trio Mate-Dev" >> "$GITHUB_OUTPUT"
+            echo "desktop_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
             echo "desktop_artifact_product_name=Aureink-Dev" >> "$GITHUB_OUTPUT"
           fi
 
