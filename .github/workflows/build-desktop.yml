@@ -402,6 +402,9 @@ jobs:
           AWS_DEFAULT_REGION: cn-north-1
           AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
         run: |
+          if command -v sntp >/dev/null 2>&1; then
+            sudo sntp -sS time.apple.com || true
+          fi
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
           UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
@@ -809,6 +812,9 @@ jobs:
           AWS_DEFAULT_REGION: cn-north-1
           AWS_SECRET_ACCESS_KEY: ${{ secrets.QINIU_SECRET_KEY }}
         run: |
+          if command -v sntp >/dev/null 2>&1; then
+            sudo sntp -sS time.apple.com || true
+          fi
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
           UPLOAD_VERSION="${{ steps.upload.outputs.artifact_version }}"
