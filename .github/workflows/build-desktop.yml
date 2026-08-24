@@ -317,6 +317,7 @@ jobs:
         working-directory: source/apps/desktop
         env:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -357,7 +358,11 @@ jobs:
           APP_PATH="${APP_BIN%/Contents/MacOS/*}"
           if [ -n "${MAC_CSC_LINK:-}" ]; then
             codesign --verify --deep --strict --verbose=3 "$APP_PATH"
-            spctl --assess --type exec --verbose=3 "$APP_PATH"
+            if [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+              spctl --assess --type exec --verbose=3 "$APP_PATH"
+            else
+              echo "Skipping Gatekeeper assessment (notarization credentials not configured)"
+            fi
           else
             echo "Skipping signature verification (unsigned build)"
           fi
@@ -719,6 +724,7 @@ jobs:
         working-directory: source/apps/desktop
         env:
           MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           VERSION="${{ steps.pkg.outputs.app_version }}"
           RELEASE_DIR="release/${VERSION}"
@@ -759,7 +765,11 @@ jobs:
           APP_PATH="${APP_BIN%/Contents/MacOS/*}"
           if [ -n "${MAC_CSC_LINK:-}" ]; then
             codesign --verify --deep --strict --verbose=3 "$APP_PATH"
-            spctl --assess --type exec --verbose=3 "$APP_PATH"
+            if [ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+              spctl --assess --type exec --verbose=3 "$APP_PATH"
+            else
+              echo "Skipping Gatekeeper assessment (notarization credentials not configured)"
+            fi
           else
             echo "Skipping signature verification (unsigned build)"
           fi
